@@ -1,0 +1,750 @@
+# core/events.py
+from enum import Enum
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+class EventType(Enum):
+    MARKET = "market"
+    SIGNAL = "signal"
+    ORDER = "order"
+    FILL = "fill"
+    RISK = "risk"
+
+@dataclass
+class Event:
+    """基础事件类"""
+    type: EventType
+    timestamp: datetime
+    
+@dataclass
+class MarketEvent(Event):
+    """市场数据事件"""
+    symbol: str
+    data: Dict[str, Any]  # OHLCV + 其他字段
+    frequency: str  # tick, 1min, 1d, etc.
+    
+@dataclass
+class SignalEvent(Event):
+    """策略信号事件"""
+    symbol: str
+    signal_type: str  # LONG, SHORT, EXIT
+    strength: float  # 信号强度 0-1
+    strategy_id: str
+    metadata: Dict[str, Any]
+    
+@dataclass
+class OrderEvent(Event):
+    """订单事件"""
+    symbol: str
+    order_type: str  # MARKET, LIMIT
+    quantity: float
+    direction: str  # BUY, SELL
+    price: Optional[float] = None
+    
+@dataclass
+class FillEvent(Event):
+    """成交事件"""
+    symbol: str
+    quantity: float
+    direction: str
+    fill_price: float
+    commission: float
+# core/event_bus.py
+import asyncio
+from collections import defaultdict
+from typing import Callable, List
+import logging
+
+class EventBus:
+    """异步事件总线"""
+    
+    def __init__(self):
+        self.subscribers = defaultdict(list)
+        self.queue = asyncio.Queue()
+        self.logger = logging.getLogger(__name__)
+        
+    def subscribe(self, event_type: EventType, handler: Callable):
+        """订阅事件"""
+        self.subscribers[event_type].append(handler)
+        
+    async def publish(self, event: Event):
+        """发布事件"""
+        await self.queue.put(event)
+        
+    async def process(self):
+        """处理事件队列"""
+        while True:
+            event = await self.queue.get()
+            handlers = self.subscribers.get(event.type, [])
+            
+            # 并行处理所有订阅者
+            tasks = [handler(event) for handler in handlers]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 错误处理
+            for result in results:
+                if isinstance(result, Exception):
+                    self.logger.error(f"Handler error: {result}")
+                    
+            self.queue.task_done()
+# data/data_handler.py
+from abc import ABC, abstractmethod
+import pandas as pd
+from typing import Optional, List
+from datetime import datetime
+
+class DataHandler(ABC):
+    """数据源抽象基类"""
+    
+    @abstractmethod
+    async def get_latest_bars(self, symbol: str, N: int = 1) -> pd.DataFrame:
+        """获取最新N条bar"""
+        pass
+    
+    @abstractmethod
+    async def update_bars(self) -> List[MarketEvent]:
+        """更新数据并返回市场事件"""
+        pass
+    
+    @abstractmethod
+    def get_latest_bar_value(self, symbol: str, val_type: str) -> float:
+        """获取最新bar的某个值"""
+        pass
+
+class CSVDataHandler(DataHandler):
+    """CSV文件数据源"""
+    
+    def __init__(self, csv_dir: str, symbols: List[str]):
+        self.csv_dir = csv_dir
+        self.symbols = symbols
+        self.symbol_data = {}
+        self.latest_symbol_data = {}
+        self.continue_backtest = True
+        self._load_data()
+        
+    def _load_data(self):
+        """加载CSV数据到内存"""
+        for symbol in self.symbols:
+            df = pd.read_csv(f"{self.csv_dir}/{symbol}.csv",
+                           parse_dates=['datetime'],
+                           index_col='datetime')
+            self.symbol_data[symbol] = df
+            self.latest_symbol_data[symbol] = []
+            
+    async def update_bars(self) -> List[MarketEvent]:
+        """模拟实时数据流"""
+        events = []
+        for symbol in self.symbols:
+            try:
+                bar = next(self.symbol_data[symbol].iterrows())
+                self.latest_symbol_data[symbol].append(bar)
+                
+                event = MarketEvent(
+                    type=EventType.MARKET,
+                    timestamp=bar[0],
+                    symbol=symbol,
+                    data=bar[1].to_dict(),
+                    frequency='1d'
+                )
+                events.append(event)
+            except StopIteration:
+                self.continue_backtest = False
+                
+        return events
+
+class LiveDataHandler(DataHandler):
+    """实时数据源（WebSocket）"""
+    
+    def __init__(self, ws_url: str, api_key: str):
+        self.ws_url = ws_url
+        self.api_key = api_key
+        # WebSocket连接逻辑
+        pass
+# factor/factor_engine.py
+from abc import ABC, abstractmethod
+import numpy as np
+import pandas as pd
+from typing import Dict, Any
+
+class Factor(ABC):
+    """因子基类"""
+    
+    def __init__(self, name: str):
+        self.name = name
+        
+    @abstractmethod
+    def calculate(self, data: pd.DataFrame) -> pd.Series:
+        """计算因子值"""
+        pass
+    
+    @abstractmethod
+    def get_required_data(self) -> List[str]:
+        """返回所需的数据字段"""
+        pass
+
+class TechnicalFactor(Factor):
+    """技术因子"""
+    pass
+
+class MomentumFactor(TechnicalFactor):
+    """动量因子"""
+    
+    def __init__(self, period: int = 20):
+        super().__init__(f"momentum_{period}")
+        self.period = period
+        
+    def calculate(self, data: pd.DataFrame) -> pd.Series:
+        """计算N日动量"""
+        return data['close'].pct_change(self.period)
+    
+    def get_required_data(self) -> List[str]:
+        return ['close']
+
+class MeanReversionFactor(TechnicalFactor):
+    """均值回归因子"""
+    
+    def __init__(self, period: int = 20, std_dev: float = 2.0):
+        super().__init__(f"mean_reversion_{period}_{std_dev}")
+        self.period = period
+        self.std_dev = std_dev
+        
+    def calculate(self, data: pd.DataFrame) -> pd.Series:
+        """计算Z-score"""
+        mean = data['close'].rolling(window=self.period).mean()
+        std = data['close'].rolling(window=self.period).std()
+        z_score = (data['close'] - mean) / std
+        return -z_score  # 负值表示超卖（买入信号）
+    
+    def get_required_data(self) -> List[str]:
+        return ['close']
+
+class FundamentalFactor(Factor):
+    """基本面因子"""
+    pass
+
+class ValueFactor(FundamentalFactor):
+    """价值因子 (P/E, P/B等)"""
+    
+    def __init__(self, metric: str = 'pe_ratio'):
+        super().__init__(f"value_{metric}")
+        self.metric = metric
+        
+    def calculate(self, data: pd.DataFrame) -> pd.Series:
+        """计算价值因子（低PE = 高分数）"""
+        return 1 / data[self.metric]
+    
+    def get_required_data(self) -> List[str]:
+        return [self.metric]
+
+class FactorEngine:
+    """因子计算引擎"""
+    
+    def __init__(self):
+        self.factors: Dict[str, Factor] = {}
+        
+    def register_factor(self, factor: Factor):
+        """注册因子"""
+        self.factors[factor.name] = factor
+        
+    def calculate_factors(self, data: pd.DataFrame) -> pd.DataFrame:
+        """计算所有因子"""
+        factor_values = {}
+        for name, factor in self.factors.items():
+            factor_values[name] = factor.calculate(data)
+        return pd.DataFrame(factor_values)
+    
+    def get_factor_scores(self, data: pd.DataFrame, 
+                         weights: Dict[str, float]) -> pd.Series:
+        """计算加权因子得分"""
+        factor_df = self.calculate_factors(data)
+        
+        # 标准化
+        factor_normalized = (factor_df - factor_df.mean()) / factor_df.std()
+        
+        # 加权求和
+        score = sum(factor_normalized[name] * weight 
+                   for name, weight in weights.items())
+        return score
+# strategy/base_strategy.py
+from abc import ABC, abstractmethod
+import pandas as pd
+from typing import List, Optional
+
+class Strategy(ABC):
+    """策略基类"""
+    
+    def __init__(self, name: str, symbols: List[str]):
+        self.name = name
+        self.symbols = symbols
+        self.bars = {}  # 存储历史数据
+        
+    @abstractmethod
+    async def on_market_event(self, event: MarketEvent) -> Optional[SignalEvent]:
+        """处理市场事件，返回交易信号"""
+        pass
+    
+    def update_bars(self, event: MarketEvent):
+        """更新bar数据"""
+        symbol = event.symbol
+        if symbol not in self.bars:
+            self.bars[symbol] = []
+        self.bars[symbol].append(event.data)
+
+class MultiFactorStrategy(Strategy):
+    """多因子策略"""
+    
+    def __init__(self, name: str, symbols: List[str], 
+                 factor_engine: FactorEngine,
+                 factor_weights: Dict[str, float],
+                 threshold: float = 0.5):
+        super().__init__(name, symbols)
+        self.factor_engine = factor_engine
+        self.factor_weights = factor_weights
+        self.threshold = threshold
+        
+    async def on_market_event(self, event: MarketEvent) -> Optional[SignalEvent]:
+        """基于因子得分生成信号"""
+        self.update_bars(event)
+        
+        # 需要足够的历史数据
+        if len(self.bars[event.symbol]) < 100:
+            return None
+            
+        # 转换为DataFrame
+        df = pd.DataFrame(self.bars[event.symbol])
+        
+        # 计算因子得分
+        score = self.factor_engine.get_factor_scores(df, self.factor_weights)
+        latest_score = score.iloc[-1]
+        
+        # 生成信号
+        if latest_score > self.threshold:
+            return SignalEvent(
+                type=EventType.SIGNAL,
+                timestamp=event.timestamp,
+                symbol=event.symbol,
+                signal_type='LONG',
+                strength=min(latest_score, 1.0),
+                strategy_id=self.name,
+                metadata={'score': latest_score}
+            )
+        elif latest_score < -self.threshold:
+            return SignalEvent(
+                type=EventType.SIGNAL,
+                timestamp=event.timestamp,
+                symbol=event.symbol,
+                signal_type='SHORT',
+                strength=min(abs(latest_score), 1.0),
+                strategy_id=self.name,
+                metadata={'score': latest_score}
+            )
+        return None
+# risk/risk_manager.py
+from typing import Optional
+import logging
+
+class RiskManager:
+    """风险管理器"""
+    
+    def __init__(self, 
+                 max_position_size: float = 0.1,  # 单个持仓最大占比
+                 max_total_risk: float = 0.5,      # 总风险敞口
+                 max_daily_loss: float = 0.05):    # 最大日损失
+        self.max_position_size = max_position_size
+        self.max_total_risk = max_total_risk
+        self.max_daily_loss = max_daily_loss
+        self.daily_pnl = 0.0
+        self.logger = logging.getLogger(__name__)
+        
+    async def validate_order(self, 
+                            order: OrderEvent,
+                            portfolio_value: float,
+                            current_positions: Dict[str, float]) -> bool:
+        """验证订单是否符合风控规则"""
+        
+        # 检查单个持仓限制
+        order_value = order.quantity * order.price if order.price else 0
+        if order_value / portfolio_value > self.max_position_size:
+            self.logger.warning(f"Order exceeds position limit: {order.symbol}")
+            return False
+            
+        # 检查总风险敞口
+        total_exposure = sum(abs(pos) for pos in current_positions.values())
+        if total_exposure / portfolio_value > self.max_total_risk:
+            self.logger.warning(f"Total exposure exceeds limit")
+            return False
+            
+        # 检查日损失限制
+        if self.daily_pnl / portfolio_value < -self.max_daily_loss:
+            self.logger.warning(f"Daily loss limit reached")
+            return False
+            
+        return True
+    
+    def update_daily_pnl(self, pnl: float):
+        """更新每日盈亏"""
+        self.daily_pnl += pnl
+        
+    def reset_daily_stats(self):
+        """重置每日统计"""
+        self.daily_pnl = 0.0
+# portfolio/portfolio.py
+from collections import defaultdict
+from typing import Dict
+import pandas as pd
+
+class Portfolio:
+    """投资组合管理"""
+    
+    def __init__(self, initial_capital: float = 100000):
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.positions = defaultdict(int)  # {symbol: quantity}
+        self.holdings = {}  # {symbol: current_value}
+        self.all_positions = []
+        self.all_holdings = []
+        
+    async def update_from_fill(self, fill: FillEvent):
+        """根据成交更新持仓"""
+        direction = 1 if fill.direction == 'BUY' else -1
+        self.positions[fill.symbol] += direction * fill.quantity
+        
+        # 更新资金
+        cost = fill.fill_price * fill.quantity
+        self.current_capital -= direction * (cost + fill.commission)
+        
+    async def update_market_value(self, market_data: Dict[str, float]):
+        """更新市场价值"""
+        total_value = self.current_capital
+        
+        for symbol, quantity in self.positions.items():
+            if quantity != 0:
+                market_price = market_data.get(symbol, 0)
+                self.holdings[symbol] = quantity * market_price
+                total_value += self.holdings[symbol]
+                
+        self.all_holdings.append({
+            'datetime': pd.Timestamp.now(),
+            'total_value': total_value,
+            'cash': self.current_capital,
+            **self.holdings
+        })
+        
+    def get_current_positions(self) -> Dict[str, float]:
+        """获取当前持仓"""
+        return dict(self.positions)
+    
+    def calculate_returns(self) -> pd.Series:
+        """计算收益率曲线"""
+        holdings_df = pd.DataFrame(self.all_holdings)
+        holdings_df.set_index('datetime', inplace=True)
+        returns = holdings_df['total_value'].pct_change()
+        return returns
+# execution/execution_engine.py
+from abc import ABC, abstractmethod
+import random
+
+class ExecutionHandler(ABC):
+    """执行处理器基类"""
+    
+    @abstractmethod
+    async def execute_order(self, order: OrderEvent) -> FillEvent:
+        """执行订单"""
+        pass
+
+class SimulatedExecutionHandler(ExecutionHandler):
+    """模拟执行（回测用）"""
+    
+    def __init__(self, commission: float = 0.001):
+        self.commission = commission
+        
+    async def execute_order(self, order: OrderEvent) -> FillEvent:
+        """模拟市价单成交"""
+        # 简化：假设按订单价格成交
+        fill_price = order.price if order.price else 0
+        commission = fill_price * order.quantity * self.commission
+        
+        # 添加滑点
+        slippage = fill_price * random.uniform(-0.0001, 0.0001)
+        fill_price += slippage
+        
+        return FillEvent(
+            type=EventType.FILL,
+            timestamp=order.timestamp,
+            symbol=order.symbol,
+            quantity=order.quantity,
+            direction=order.direction,
+            fill_price=fill_price,
+            commission=commission
+        )
+
+class LiveExecutionHandler(ExecutionHandler):
+    """实盘执行"""
+    
+    def __init__(self, broker_api):
+        self.broker_api = broker_api
+        
+    async def execute_order(self, order: OrderEvent) -> FillEvent:
+        """通过券商API执行"""
+        # 调用券商API
+        fill_info = await self.broker_api.place_order(order)
+        
+        return FillEvent(
+            type=EventType.FILL,
+            timestamp=fill_info['timestamp'],
+            symbol=order.symbol,
+            quantity=fill_info['filled_quantity'],
+            direction=order.direction,
+            fill_price=fill_info['avg_price'],
+            commission=fill_info['commission']
+        )
+# backtest/backtest_engine.py
+import asyncio
+from datetime import datetime
+import logging
+
+class BacktestEngine:
+    """回测引擎"""
+    
+    def __init__(self,
+                 data_handler: DataHandler,
+                 strategy: Strategy,
+                 portfolio: Portfolio,
+                 execution_handler: ExecutionHandler,
+                 risk_manager: RiskManager):
+        self.data_handler = data_handler
+        self.strategy = strategy
+        self.portfolio = portfolio
+        self.execution_handler = execution_handler
+        self.risk_manager = risk_manager
+        self.event_bus = EventBus()
+        self.logger = logging.getLogger(__name__)
+        
+        self._setup_event_handlers()
+        
+    def _setup_event_handlers(self):
+        """设置事件处理器"""
+        self.event_bus.subscribe(EventType.MARKET, self._handle_market_event)
+        self.event_bus.subscribe(EventType.SIGNAL, self._handle_signal_event)
+        self.event_bus.subscribe(EventType.ORDER, self._handle_order_event)
+        self.event_bus.subscribe(EventType.FILL, self._handle_fill_event)
+        
+    async def _handle_market_event(self, event: MarketEvent):
+        """处理市场数据"""
+        signal = await self.strategy.on_market_event(event)
+        if signal:
+            await self.event_bus.publish(signal)
+            
+    async def _handle_signal_event(self, event: SignalEvent):
+        """处理交易信号"""
+        # 简化：根据信号强度计算订单大小
+        portfolio_value = self.portfolio.current_capital
+        order_value = portfolio_value * 0.1 * event.strength
+        
+        # 获取最新价格
+        current_price = self.data_handler.get_latest_bar_value(
+            event.symbol, 'close'
+        )
+        quantity = order_value / current_price
+        
+        order = OrderEvent(
+            type=EventType.ORDER,
+            timestamp=event.timestamp,
+            symbol=event.symbol,
+            order_type='MARKET',
+            quantity=quantity,
+            direction='BUY' if event.signal_type == 'LONG' else 'SELL',
+            price=current_price
+        )
+        
+        # 风控检查
+        if await self.risk_manager.validate_order(
+            order, 
+            portfolio_value,
+            self.portfolio.get_current_positions()
+        ):
+            await self.event_bus.publish(order)
+            
+    async def _handle_order_event(self, event: OrderEvent):
+        """处理订单"""
+        fill = await self.execution_handler.execute_order(event)
+        await self.event_bus.publish(fill)
+        
+    async def _handle_fill_event(self, event: FillEvent):
+        """处理成交"""
+        await self.portfolio.update_from_fill(event)
+        
+    async def run(self):
+        """运行回测"""
+        self.logger.info("Starting backtest...")
+        
+        # 启动事件处理循环
+        event_processor = asyncio.create_task(self.event_bus.process())
+        
+        # 主循环：推送市场数据
+        while self.data_handler.continue_backtest:
+            # 获取新的bar
+            market_events = await self.data_handler.update_bars()
+            
+            # 发布市场事件
+            for event in market_events:
+                await self.event_bus.publish(event)
+                
+            # 更新投资组合市值
+            market_data = {
+                symbol: self.data_handler.get_latest_bar_value(symbol, 'close')
+                for symbol in self.strategy.symbols
+            }
+            await self.portfolio.update_market_value(market_data)
+            
+            # 等待事件处理完成
+            await self.event_bus.queue.join()
+            
+        self.logger.info("Backtest completed")
+        event_processor.cancel()
+# analytics/performance.py
+import pandas as pd
+import numpy as np
+from typing import Dict
+
+class PerformanceAnalyzer:
+    """绩效分析"""
+    
+    def __init__(self, portfolio: Portfolio):
+        self.portfolio = portfolio
+        
+    def calculate_metrics(self) -> Dict[str, float]:
+        """计算各项指标"""
+        returns = self.portfolio.calculate_returns()
+        
+        # 年化收益率
+        total_return = (self.portfolio.current_capital / 
+                       self.portfolio.initial_capital - 1)
+        num_years = len(returns) / 252  # 假设252个交易日
+        annual_return = (1 + total_return) ** (1 / num_years) - 1
+        
+        # 年化波动率
+        annual_volatility = returns.std() * np.sqrt(252)
+        
+        # 夏普比率（假设无风险利率3%）
+        risk_free_rate = 0.03
+        sharpe_ratio = (annual_return - risk_free_rate) / annual_volatility
+        
+        # 最大回撤
+        cumulative = (1 + returns).cumprod()
+        running_max = cumulative.expanding().max()
+        drawdown = (cumulative - running_max) / running_max
+        max_drawdown = drawdown.min()
+        
+        # 胜率
+        winning_days = (returns > 0).sum()
+        total_days = len(returns)
+        win_rate = winning_days / total_days if total_days > 0 else 0
+        
+        return {
+            'total_return': total_return,
+            'annual_return': annual_return,
+            'annual_volatility': annual_volatility,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'win_rate': win_rate,
+            'total_trades': len(self.portfolio.all_holdings)
+        }
+    
+    def plot_equity_curve(self):
+        """绘制权益曲线"""
+        holdings_df = pd.DataFrame(self.portfolio.all_holdings)
+        holdings_df.set_index('datetime', inplace=True)
+        
+        # 使用matplotlib绘制
+        import matplotlib.pyplot as plt
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # 权益曲线
+        ax1.plot(holdings_df.index, holdings_df['total_value'])
+        ax1.set_title('Portfolio Value')
+        ax1.set_ylabel('Value ($)')
+        ax1.grid(True)
+        
+        # 回撤
+        returns = holdings_df['total_value'].pct_change()
+        cumulative = (1 + returns).cumprod()
+        running_max = cumulative.expanding().max()
+        drawdown = (cumulative - running_max) / running_max
+        
+        ax2.fill_between(drawdown.index, drawdown, 0, alpha=0.3, color='red')
+        ax2.set_title('Drawdown')
+        ax2.set_ylabel('Drawdown (%)')
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+# main.py
+import asyncio
+from datetime import datetime
+
+async def main():
+    # 1. 初始化数据源
+    data_handler = CSVDataHandler(
+        csv_dir='./data',
+        symbols=['AAPL', 'MSFT', 'GOOGL']
+    )
+    
+    # 2. 配置因子引擎
+    factor_engine = FactorEngine()
+    factor_engine.register_factor(MomentumFactor(period=20))
+    factor_engine.register_factor(MeanReversionFactor(period=20, std_dev=2))
+    factor_engine.register_factor(ValueFactor(metric='pe_ratio'))
+    
+    # 3. 创建策略
+    strategy = MultiFactorStrategy(
+        name='multi_factor_strategy',
+        symbols=['AAPL', 'MSFT', 'GOOGL'],
+        factor_engine=factor_engine,
+        factor_weights={
+            'momentum_20': 0.3,
+            'mean_reversion_20_2.0': 0.3,
+            'value_pe_ratio': 0.4
+        },
+        threshold=0.5
+    )
+    
+    # 4. 初始化组件
+    portfolio = Portfolio(initial_capital=100000)
+    execution_handler = SimulatedExecutionHandler(commission=0.001)
+    risk_manager = RiskManager(
+        max_position_size=0.1,
+        max_total_risk=0.5,
+        max_daily_loss=0.05
+    )
+    
+    # 5. 创建回测引擎
+    backtest = BacktestEngine(
+        data_handler=data_handler,
+        strategy=strategy,
+        portfolio=portfolio,
+        execution_handler=execution_handler,
+        risk_manager=risk_manager
+    )
+    
+    # 6. 运行回测
+    await backtest.run()
+    
+    # 7. 性能分析
+    analyzer = PerformanceAnalyzer(portfolio)
+    metrics = analyzer.calculate_metrics()
+    
+    print("\n=== Backtest Results ===")
+    for key, value in metrics.items():
+        print(f"{key}: {value:.4f}")
+    
+    analyzer.plot_equity_curve()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+
