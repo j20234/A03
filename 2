@@ -1106,6 +1106,21 @@ python -m venv quant_env
 source quant_env/bin/activate  # Windows: quant_env\Scripts\activate
 pip install -r requirements.txt
 python main.py
+python -m venv quant_env
+source quant_env/bin/activate  # Windows: quant_env\Scripts\activate
+pip install -r requirements.txt
+python main.py
+## 安装
+```bash
+git clone https://github.com/j20234/A03.git
+cd A03
+pip install -r requirements.txt
+python main.py  # 运行AAPL日线回测
+git add .github/workflows/test.yml
+git commit -m "Add GitHub Actions CI for automated testing"
+git push origin main
+
+
 
 
 
