@@ -11,20 +11,20 @@ class EventType(Enum):
     FILL = "fill"
     RISK = "risk"
 
-@dataclass
+@dataclass(slots=True)
 class Event:
     """基础事件类"""
     type: EventType
     timestamp: datetime
     
-@dataclass
+@dataclass(slots=True)
 class MarketEvent(Event):
     """市场数据事件"""
     symbol: str
     data: Dict[str, Any]  # OHLCV + 其他字段
     frequency: str  # tick, 1min, 1d, etc.
     
-@dataclass
+@dataclass(slots=True)
 class SignalEvent(Event):
     """策略信号事件"""
     symbol: str
@@ -33,7 +33,7 @@ class SignalEvent(Event):
     strategy_id: str
     metadata: Dict[str, Any]
     
-@dataclass
+@dataclass(slots=True)
 class OrderEvent(Event):
     """订单事件"""
     symbol: str
@@ -42,7 +42,7 @@ class OrderEvent(Event):
     direction: str  # BUY, SELL
     price: Optional[float] = None
     
-@dataclass
+@dataclass(slots=True)
 class FillEvent(Event):
     """成交事件"""
     symbol: str
@@ -73,25 +73,38 @@ class EventBus:
         await self.queue.put(event)
         
     async def process(self):
-        """处理事件队列"""
+        """处理事件队列（批处理以降低协程调度开销）"""
+        BATCH_SIZE = 256
         while True:
-            event = await self.queue.get()
-            handlers = self.subscribers.get(event.type, [])
-            
-            # 并行处理所有订阅者
-            tasks = [handler(event) for handler in handlers]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 错误处理
-            for result in results:
-                if isinstance(result, Exception):
-                    self.logger.error(f"Handler error: {result}")
-                    
-            self.queue.task_done()
+            events = [await self.queue.get()]
+            try:
+                # 尝试批量获取更多事件（非阻塞）
+                for _ in range(BATCH_SIZE - 1):
+                    events.append(self.queue.get_nowait())
+            except asyncio.QueueEmpty:
+                pass
+
+            # 对每个事件分发给各自订阅者
+            all_tasks = []
+            for event in events:
+                handlers = self.subscribers.get(event.type, [])
+                all_tasks.extend(handler(event) for handler in handlers)
+
+            if all_tasks:
+                results = await asyncio.gather(*all_tasks, return_exceptions=True)
+                # 错误处理
+                for result in results:
+                    if isinstance(result, Exception):
+                        self.logger.error(f"Handler error: {result}")
+
+            # 标记批量完成
+            for _ in events:
+                self.queue.task_done()
 # data/data_handler.py
 from abc import ABC, abstractmethod
 import pandas as pd
-from typing import Optional, List
+from typing import Optional, List, Dict, Deque, Iterator, Any
+from collections import deque
 from datetime import datetime
 
 class DataHandler(ABC):
@@ -118,40 +131,75 @@ class CSVDataHandler(DataHandler):
     def __init__(self, csv_dir: str, symbols: List[str]):
         self.csv_dir = csv_dir
         self.symbols = symbols
-        self.symbol_data = {}
-        self.latest_symbol_data = {}
+        self.symbol_data: Dict[str, pd.DataFrame] = {}
+        self.latest_symbol_data: Dict[str, Deque[Dict[str, Any]]] = {}
+        self._iterators: Dict[str, Iterator] = {}
+        self.max_history: int = 512  # 限制历史窗口，控制内存占用
         self.continue_backtest = True
         self._load_data()
         
     def _load_data(self):
         """加载CSV数据到内存"""
         for symbol in self.symbols:
-            df = pd.read_csv(f"{self.csv_dir}/{symbol}.csv",
-                           parse_dates=['datetime'],
-                           index_col='datetime')
+            df = pd.read_csv(
+                f"{self.csv_dir}/{symbol}.csv",
+                parse_dates=['datetime'],
+                index_col='datetime'
+            )
+            # 预创建行迭代器（避免每次重新创建，提升性能）
             self.symbol_data[symbol] = df
-            self.latest_symbol_data[symbol] = []
+            self._iterators[symbol] = df.itertuples()
+            # 使用有界deque限制历史长度（降低内存占用）
+            self.latest_symbol_data[symbol] = deque(maxlen=self.max_history)
             
     async def update_bars(self) -> List[MarketEvent]:
         """模拟实时数据流"""
-        events = []
+        events: List[MarketEvent] = []
         for symbol in self.symbols:
             try:
-                bar = next(self.symbol_data[symbol].iterrows())
-                self.latest_symbol_data[symbol].append(bar)
-                
+                row = next(self._iterators[symbol])
+                row_dict = row._asdict()
+                # pandas.itertuples 将索引命名为 'Index'
+                timestamp = row_dict.pop('Index') if 'Index' in row_dict else None
+                if timestamp is None:
+                    # 回退：从DataFrame索引取当前长度对应位置（理论不应触发）
+                    timestamp = self.symbol_data[symbol].index[len(self.latest_symbol_data[symbol])]  # type: ignore[index]
+
+                # 追加到有限历史窗口
+                self.latest_symbol_data[symbol].append(row_dict)
+
                 event = MarketEvent(
                     type=EventType.MARKET,
-                    timestamp=bar[0],
+                    timestamp=timestamp,
                     symbol=symbol,
-                    data=bar[1].to_dict(),
+                    data=row_dict,
                     frequency='1d'
                 )
                 events.append(event)
             except StopIteration:
+                # 任一标的无数据则停止回测
                 self.continue_backtest = False
-                
         return events
+
+    async def get_latest_bars(self, symbol: str, N: int = 1) -> pd.DataFrame:
+        """获取最新N条bar（O(N)转换，基于受限历史窗口）"""
+        history = list(self.latest_symbol_data.get(symbol, []))
+        if not history:
+            return pd.DataFrame()
+        tail = history[-N:] if N > 0 else history
+        return pd.DataFrame(tail)
+
+    def get_latest_bar_value(self, symbol: str, val_type: str) -> float:
+        """获取最新bar指定字段（O(1)）"""
+        dq = self.latest_symbol_data.get(symbol)
+        if not dq:
+            return float('nan')
+        latest = dq[-1]
+        value = latest.get(val_type)
+        try:
+            return float(value) if value is not None else float('nan')
+        except (TypeError, ValueError):
+            return float('nan')
 
 class LiveDataHandler(DataHandler):
     """实时数据源（WebSocket）"""
@@ -242,34 +290,41 @@ class FactorEngine:
     
     def __init__(self):
         self.factors: Dict[str, Factor] = {}
+        # 指标缓存：按因子名缓存最近一次的计算结果索引长度与尾值
+        self._last_lengths: Dict[str, int] = {}
+        self._last_values: Dict[str, float] = {}
         
     def register_factor(self, factor: Factor):
         """注册因子"""
         self.factors[factor.name] = factor
         
     def calculate_factors(self, data: pd.DataFrame) -> pd.DataFrame:
-        """计算所有因子"""
-        factor_values = {}
+        """计算所有因子（对小窗口数据计算，返回整列以保持兼容）"""
+        factor_values: Dict[str, pd.Series] = {}
         for name, factor in self.factors.items():
-            factor_values[name] = factor.calculate(data)
+            series = factor.calculate(data)
+            factor_values[name] = series
         return pd.DataFrame(factor_values)
     
     def get_factor_scores(self, data: pd.DataFrame, 
-                         weights: Dict[str, float]) -> pd.Series:
-        """计算加权因子得分"""
+                          weights: Dict[str, float]) -> pd.Series:
+        """计算加权因子得分（数值稳定的标准化）"""
         factor_df = self.calculate_factors(data)
-        
-        # 标准化
-        factor_normalized = (factor_df - factor_df.mean()) / factor_df.std()
-        
+
+        # 数值稳定的标准化（避免除零）
+        means = factor_df.mean()
+        stds = factor_df.std(ddof=0).replace(0, 1.0)
+        factor_normalized = (factor_df - means) / stds
+
         # 加权求和
-        score = sum(factor_normalized[name] * weight 
-                   for name, weight in weights.items())
+        score = sum(factor_normalized.get(name, 0) * weight 
+                    for name, weight in weights.items())
         return score
 # strategy/base_strategy.py
 from abc import ABC, abstractmethod
 import pandas as pd
-from typing import List, Optional
+from typing import List, Optional, Dict, Deque, Any
+from collections import deque
 
 class Strategy(ABC):
     """策略基类"""
@@ -277,7 +332,9 @@ class Strategy(ABC):
     def __init__(self, name: str, symbols: List[str]):
         self.name = name
         self.symbols = symbols
-        self.bars = {}  # 存储历史数据
+        # 使用有界deque降低内存并保证窗口内操作高效
+        self.max_history: int = 512
+        self.bars: Dict[str, Deque[Dict[str, Any]]] = {}
         
     @abstractmethod
     async def on_market_event(self, event: MarketEvent) -> Optional[SignalEvent]:
@@ -288,7 +345,7 @@ class Strategy(ABC):
         """更新bar数据"""
         symbol = event.symbol
         if symbol not in self.bars:
-            self.bars[symbol] = []
+            self.bars[symbol] = deque(maxlen=self.max_history)
         self.bars[symbol].append(event.data)
 
 class MultiFactorStrategy(Strategy):
@@ -304,19 +361,19 @@ class MultiFactorStrategy(Strategy):
         self.threshold = threshold
         
     async def on_market_event(self, event: MarketEvent) -> Optional[SignalEvent]:
-        """基于因子得分生成信号"""
+        """基于因子得分生成信号（窗口化计算以提升性能）"""
         self.update_bars(event)
-        
+
         # 需要足够的历史数据
         if len(self.bars[event.symbol]) < 100:
             return None
-            
-        # 转换为DataFrame
-        df = pd.DataFrame(self.bars[event.symbol])
-        
+
+        # 转换为DataFrame（仅窗口内数据）
+        df = pd.DataFrame(list(self.bars[event.symbol]))
+
         # 计算因子得分
         score = self.factor_engine.get_factor_scores(df, self.factor_weights)
-        latest_score = score.iloc[-1]
+        latest_score = float(score.iloc[-1])
         
         # 生成信号
         if latest_score > self.threshold:
@@ -415,21 +472,25 @@ class Portfolio:
         self.current_capital -= direction * (cost + fill.commission)
         
     async def update_market_value(self, market_data: Dict[str, float]):
-        """更新市场价值"""
+        """更新市场价值（减少重复字典查找与局部分配）"""
         total_value = self.current_capital
-        
-        for symbol, quantity in self.positions.items():
-            if quantity != 0:
-                market_price = market_data.get(symbol, 0)
-                self.holdings[symbol] = quantity * market_price
-                total_value += self.holdings[symbol]
-                
-        self.all_holdings.append({
+        positions = self.positions
+        holdings = self.holdings
+
+        for symbol, quantity in positions.items():
+            if quantity:
+                market_price = market_data.get(symbol, 0.0)
+                holding_value = quantity * market_price
+                holdings[symbol] = holding_value
+                total_value += holding_value
+
+        snapshot = {
             'datetime': pd.Timestamp.now(),
             'total_value': total_value,
             'cash': self.current_capital,
-            **self.holdings
-        })
+            **holdings
+        }
+        self.all_holdings.append(snapshot)
         
     def get_current_positions(self) -> Dict[str, float]:
         """获取当前持仓"""
@@ -461,13 +522,13 @@ class SimulatedExecutionHandler(ExecutionHandler):
         
     async def execute_order(self, order: OrderEvent) -> FillEvent:
         """模拟市价单成交"""
-        # 简化：假设按订单价格成交
-        fill_price = order.price if order.price else 0
-        commission = fill_price * order.quantity * self.commission
+        # 简化：假设按订单价格成交；保护None并避免重复计算
+        price = float(order.price) if order.price is not None else 0.0
+        commission = price * order.quantity * self.commission
         
         # 添加滑点
-        slippage = fill_price * random.uniform(-0.0001, 0.0001)
-        fill_price += slippage
+        slippage = price * random.uniform(-0.0001, 0.0001)
+        fill_price = price + slippage
         
         return FillEvent(
             type=EventType.FILL,
@@ -588,8 +649,10 @@ class BacktestEngine:
             market_events = await self.data_handler.update_bars()
             
             # 发布市场事件
-            for event in market_events:
-                await self.event_bus.publish(event)
+            # 批量并行发布，降低await开销
+            publish_tasks = [self.event_bus.publish(event) for event in market_events]
+            if publish_tasks:
+                await asyncio.gather(*publish_tasks)
                 
             # 更新投资组合市值
             market_data = {
@@ -621,18 +684,24 @@ class PerformanceAnalyzer:
         # 年化收益率
         total_return = (self.portfolio.current_capital / 
                        self.portfolio.initial_capital - 1)
-        num_years = len(returns) / 252  # 假设252个交易日
-        annual_return = (1 + total_return) ** (1 / num_years) - 1
+        num_periods = max(len(returns), 1)
+        num_years = max(num_periods / 252, 1e-6)  # 避免除零与溢出
+        # 对极端短样本做保护，避免 pow 的数值不稳定
+        try:
+            annual_return = (1 + total_return) ** (1 / num_years) - 1
+        except OverflowError:
+            annual_return = float('inf')
         
         # 年化波动率
-        annual_volatility = returns.std() * np.sqrt(252)
+        ret_std = returns.std(ddof=0)
+        annual_volatility = (ret_std * np.sqrt(252)) if ret_std > 0 else 0.0
         
         # 夏普比率（假设无风险利率3%）
         risk_free_rate = 0.03
-        sharpe_ratio = (annual_return - risk_free_rate) / annual_volatility
+        sharpe_ratio = ((annual_return - risk_free_rate) / annual_volatility) if annual_volatility > 0 else 0.0
         
         # 最大回撤
-        cumulative = (1 + returns).cumprod()
+        cumulative = (1 + returns.fillna(0)).cumprod()
         running_max = cumulative.expanding().max()
         drawdown = (cumulative - running_max) / running_max
         max_drawdown = drawdown.min()
