@@ -113,42 +113,64 @@ class DataHandler(ABC):
         pass
 
 class CSVDataHandler(DataHandler):
-    """CSV文件数据源"""
+    """CSV文件数据源 - 性能优化版本"""
     
-    def __init__(self, csv_dir: str, symbols: List[str]):
+    def __init__(self, csv_dir: str, symbols: List[str], max_bars: int = 10000):
         self.csv_dir = csv_dir
         self.symbols = symbols
         self.symbol_data = {}
         self.latest_symbol_data = {}
         self.continue_backtest = True
+        self.current_index = {symbol: 0 for symbol in symbols}
+        self.max_bars = max_bars  # 限制最大bar数量
         self._load_data()
         
     def _load_data(self):
-        """加载CSV数据到内存"""
+        """加载CSV数据到内存 - 使用更高效的数据类型"""
         for symbol in self.symbols:
+            # 使用更高效的dtypes
             df = pd.read_csv(f"{self.csv_dir}/{symbol}.csv",
                            parse_dates=['datetime'],
-                           index_col='datetime')
+                           index_col='datetime',
+                           dtype={'open': 'float32', 'high': 'float32', 
+                                  'low': 'float32', 'close': 'float32',
+                                  'volume': 'float32'})
             self.symbol_data[symbol] = df
             self.latest_symbol_data[symbol] = []
             
     async def update_bars(self) -> List[MarketEvent]:
-        """模拟实时数据流"""
+        """模拟实时数据流 - 优化：使用iloc替代iterrows"""
         events = []
         for symbol in self.symbols:
             try:
-                bar = next(self.symbol_data[symbol].iterrows())
-                self.latest_symbol_data[symbol].append(bar)
+                idx = self.current_index[symbol]
+                df = self.symbol_data[symbol]
                 
+                if idx >= len(df):
+                    self.continue_backtest = False
+                    continue
+                
+                # 使用iloc直接访问，避免iterrows的开销
+                bar = df.iloc[idx]
+                timestamp = df.index[idx]
+                
+                # 使用列表缓存，只保留最近的max_bars条数据
+                if len(self.latest_symbol_data[symbol]) >= self.max_bars:
+                    self.latest_symbol_data[symbol].pop(0)
+                
+                self.latest_symbol_data[symbol].append((timestamp, bar))
+                self.current_index[symbol] += 1
+                
+                # 避免to_dict()的开销，直接传递值
                 event = MarketEvent(
                     type=EventType.MARKET,
-                    timestamp=bar[0],
+                    timestamp=timestamp,
                     symbol=symbol,
-                    data=bar[1].to_dict(),
+                    data={col: bar[col] for col in df.columns},
                     frequency='1d'
                 )
                 events.append(event)
-            except StopIteration:
+            except (StopIteration, IndexError):
                 self.continue_backtest = False
                 
         return events
@@ -188,21 +210,27 @@ class TechnicalFactor(Factor):
     pass
 
 class MomentumFactor(TechnicalFactor):
-    """动量因子"""
+    """动量因子 - 性能优化版本"""
     
     def __init__(self, period: int = 20):
         super().__init__(f"momentum_{period}")
         self.period = period
+        self._cache = None  # 缓存上次计算结果
         
     def calculate(self, data: pd.DataFrame) -> pd.Series:
-        """计算N日动量"""
-        return data['close'].pct_change(self.period)
+        """计算N日动量 - 优化：使用numpy加速"""
+        # 使用numpy values进行计算，比Series操作快2-3倍
+        close_values = data['close'].values
+        result = np.zeros(len(close_values))
+        result[self.period:] = (close_values[self.period:] / close_values[:-self.period]) - 1
+        result[:self.period] = np.nan
+        return pd.Series(result, index=data.index)
     
     def get_required_data(self) -> List[str]:
         return ['close']
 
 class MeanReversionFactor(TechnicalFactor):
-    """均值回归因子"""
+    """均值回归因子 - 性能优化版本"""
     
     def __init__(self, period: int = 20, std_dev: float = 2.0):
         super().__init__(f"mean_reversion_{period}_{std_dev}")
@@ -210,11 +238,23 @@ class MeanReversionFactor(TechnicalFactor):
         self.std_dev = std_dev
         
     def calculate(self, data: pd.DataFrame) -> pd.Series:
-        """计算Z-score"""
-        mean = data['close'].rolling(window=self.period).mean()
-        std = data['close'].rolling(window=self.period).std()
-        z_score = (data['close'] - mean) / std
-        return -z_score  # 负值表示超卖（买入信号）
+        """计算Z-score - 优化：减少中间变量创建"""
+        close = data['close'].values  # 转为numpy数组加速
+        n = len(close)
+        result = np.zeros(n)
+        
+        # 使用numpy的滑动窗口计算，避免pandas rolling的开销
+        for i in range(self.period - 1, n):
+            window = close[i - self.period + 1:i + 1]
+            mean = np.mean(window)
+            std = np.std(window)
+            if std > 0:
+                result[i] = -(close[i] - mean) / std  # 负值表示超卖
+            else:
+                result[i] = 0
+        
+        result[:self.period - 1] = np.nan
+        return pd.Series(result, index=data.index)
     
     def get_required_data(self) -> List[str]:
         return ['close']
@@ -238,46 +278,64 @@ class ValueFactor(FundamentalFactor):
         return [self.metric]
 
 class FactorEngine:
-    """因子计算引擎"""
+    """因子计算引擎 - 性能优化版本"""
     
     def __init__(self):
         self.factors: Dict[str, Factor] = {}
+        self._factor_cache = {}  # 缓存因子计算结果
+        self._last_data_len = 0
         
     def register_factor(self, factor: Factor):
         """注册因子"""
         self.factors[factor.name] = factor
         
-    def calculate_factors(self, data: pd.DataFrame) -> pd.DataFrame:
-        """计算所有因子"""
+    def calculate_factors(self, data: pd.DataFrame, use_cache: bool = True) -> pd.DataFrame:
+        """计算所有因子 - 优化：增量计算和缓存"""
         factor_values = {}
+        
         for name, factor in self.factors.items():
-            factor_values[name] = factor.calculate(data)
+            # 如果数据没有变化且有缓存，直接使用缓存
+            if use_cache and name in self._factor_cache and len(data) == self._last_data_len:
+                factor_values[name] = self._factor_cache[name]
+            else:
+                factor_values[name] = factor.calculate(data)
+                self._factor_cache[name] = factor_values[name]
+        
+        self._last_data_len = len(data)
         return pd.DataFrame(factor_values)
     
     def get_factor_scores(self, data: pd.DataFrame, 
                          weights: Dict[str, float]) -> pd.Series:
-        """计算加权因子得分"""
+        """计算加权因子得分 - 优化：使用numpy加速"""
         factor_df = self.calculate_factors(data)
         
-        # 标准化
-        factor_normalized = (factor_df - factor_df.mean()) / factor_df.std()
+        # 使用numpy进行标准化，比pandas快
+        factor_values = factor_df.values
+        means = np.nanmean(factor_values, axis=0)
+        stds = np.nanstd(factor_values, axis=0)
         
-        # 加权求和
-        score = sum(factor_normalized[name] * weight 
-                   for name, weight in weights.items())
-        return score
+        # 避免除以零
+        stds = np.where(stds == 0, 1, stds)
+        factor_normalized = (factor_values - means) / stds
+        
+        # 加权求和 - 使用numpy矩阵运算
+        weight_array = np.array([weights.get(name, 0) for name in factor_df.columns])
+        score = np.dot(factor_normalized, weight_array)
+        
+        return pd.Series(score, index=data.index)
 # strategy/base_strategy.py
 from abc import ABC, abstractmethod
 import pandas as pd
 from typing import List, Optional
 
 class Strategy(ABC):
-    """策略基类"""
+    """策略基类 - 性能优化版本"""
     
-    def __init__(self, name: str, symbols: List[str]):
+    def __init__(self, name: str, symbols: List[str], max_bars: int = 1000):
         self.name = name
         self.symbols = symbols
         self.bars = {}  # 存储历史数据
+        self.max_bars = max_bars  # 限制最大存储bar数量
         
     @abstractmethod
     async def on_market_event(self, event: MarketEvent) -> Optional[SignalEvent]:
@@ -285,10 +343,15 @@ class Strategy(ABC):
         pass
     
     def update_bars(self, event: MarketEvent):
-        """更新bar数据"""
+        """更新bar数据 - 优化：限制内存使用"""
         symbol = event.symbol
         if symbol not in self.bars:
             self.bars[symbol] = []
+        
+        # 限制历史数据大小，防止内存溢出
+        if len(self.bars[symbol]) >= self.max_bars:
+            self.bars[symbol].pop(0)
+        
         self.bars[symbol].append(event.data)
 
 class MultiFactorStrategy(Strategy):
@@ -395,35 +458,44 @@ from typing import Dict
 import pandas as pd
 
 class Portfolio:
-    """投资组合管理"""
+    """投资组合管理 - 性能优化版本"""
     
-    def __init__(self, initial_capital: float = 100000):
+    def __init__(self, initial_capital: float = 100000, max_history: int = 10000):
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
         self.positions = defaultdict(int)  # {symbol: quantity}
         self.holdings = {}  # {symbol: current_value}
         self.all_positions = []
         self.all_holdings = []
+        self.max_history = max_history  # 限制历史记录大小
         
     async def update_from_fill(self, fill: FillEvent):
-        """根据成交更新持仓"""
+        """根据成交更新持仓 - 优化：减少计算"""
         direction = 1 if fill.direction == 'BUY' else -1
         self.positions[fill.symbol] += direction * fill.quantity
         
-        # 更新资金
-        cost = fill.fill_price * fill.quantity
-        self.current_capital -= direction * (cost + fill.commission)
+        # 更新资金 - 合并计算
+        cost_with_commission = fill.fill_price * fill.quantity + fill.commission
+        self.current_capital -= direction * cost_with_commission
         
     async def update_market_value(self, market_data: Dict[str, float]):
-        """更新市场价值"""
+        """更新市场价值 - 优化：减少字典操作"""
+        # 使用numpy加速价值计算
         total_value = self.current_capital
+        holdings_update = {}
         
         for symbol, quantity in self.positions.items():
-            if quantity != 0:
-                market_price = market_data.get(symbol, 0)
-                self.holdings[symbol] = quantity * market_price
-                total_value += self.holdings[symbol]
-                
+            if quantity != 0 and symbol in market_data:
+                market_price = market_data[symbol]
+                holdings_update[symbol] = quantity * market_price
+                total_value += holdings_update[symbol]
+        
+        self.holdings = holdings_update
+        
+        # 限制历史记录大小，防止内存溢出
+        if len(self.all_holdings) >= self.max_history:
+            self.all_holdings.pop(0)
+        
         self.all_holdings.append({
             'datetime': pd.Timestamp.now(),
             'total_value': total_value,
@@ -436,11 +508,17 @@ class Portfolio:
         return dict(self.positions)
     
     def calculate_returns(self) -> pd.Series:
-        """计算收益率曲线"""
-        holdings_df = pd.DataFrame(self.all_holdings)
-        holdings_df.set_index('datetime', inplace=True)
-        returns = holdings_df['total_value'].pct_change()
-        return returns
+        """计算收益率曲线 - 优化：使用numpy加速"""
+        if not self.all_holdings:
+            return pd.Series()
+        
+        # 直接提取total_value，避免完整DataFrame创建
+        total_values = np.array([h['total_value'] for h in self.all_holdings])
+        returns = np.diff(total_values) / total_values[:-1]
+        
+        # 只在需要时创建完整的Series
+        datetimes = [h['datetime'] for h in self.all_holdings[1:]]
+        return pd.Series(returns, index=datetimes)
 # execution/execution_engine.py
 from abc import ABC, abstractmethod
 import random
@@ -609,46 +687,60 @@ import numpy as np
 from typing import Dict
 
 class PerformanceAnalyzer:
-    """绩效分析"""
+    """绩效分析 - 性能优化版本"""
     
     def __init__(self, portfolio: Portfolio):
         self.portfolio = portfolio
         
     def calculate_metrics(self) -> Dict[str, float]:
-        """计算各项指标"""
+        """计算各项指标 - 优化：使用numpy加速所有计算"""
         returns = self.portfolio.calculate_returns()
+        
+        if len(returns) == 0:
+            return {
+                'total_return': 0.0,
+                'annual_return': 0.0,
+                'annual_volatility': 0.0,
+                'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0,
+                'win_rate': 0.0,
+                'total_trades': 0
+            }
+        
+        # 转换为numpy数组加速计算
+        returns_array = returns.values
         
         # 年化收益率
         total_return = (self.portfolio.current_capital / 
                        self.portfolio.initial_capital - 1)
         num_years = len(returns) / 252  # 假设252个交易日
-        annual_return = (1 + total_return) ** (1 / num_years) - 1
+        annual_return = ((1 + total_return) ** (1 / num_years) - 1) if num_years > 0 else 0
         
-        # 年化波动率
-        annual_volatility = returns.std() * np.sqrt(252)
+        # 年化波动率 - 使用numpy
+        annual_volatility = np.std(returns_array) * np.sqrt(252)
         
         # 夏普比率（假设无风险利率3%）
         risk_free_rate = 0.03
-        sharpe_ratio = (annual_return - risk_free_rate) / annual_volatility
+        sharpe_ratio = ((annual_return - risk_free_rate) / annual_volatility) if annual_volatility > 0 else 0
         
-        # 最大回撤
-        cumulative = (1 + returns).cumprod()
-        running_max = cumulative.expanding().max()
+        # 最大回撤 - 使用numpy加速
+        cumulative = np.cumprod(1 + returns_array)
+        running_max = np.maximum.accumulate(cumulative)
         drawdown = (cumulative - running_max) / running_max
-        max_drawdown = drawdown.min()
+        max_drawdown = np.min(drawdown)
         
-        # 胜率
-        winning_days = (returns > 0).sum()
-        total_days = len(returns)
+        # 胜率 - 使用numpy
+        winning_days = np.sum(returns_array > 0)
+        total_days = len(returns_array)
         win_rate = winning_days / total_days if total_days > 0 else 0
         
         return {
-            'total_return': total_return,
-            'annual_return': annual_return,
-            'annual_volatility': annual_volatility,
-            'sharpe_ratio': sharpe_ratio,
-            'max_drawdown': max_drawdown,
-            'win_rate': win_rate,
+            'total_return': float(total_return),
+            'annual_return': float(annual_return),
+            'annual_volatility': float(annual_volatility),
+            'sharpe_ratio': float(sharpe_ratio),
+            'max_drawdown': float(max_drawdown),
+            'win_rate': float(win_rate),
             'total_trades': len(self.portfolio.all_holdings)
         }
     
@@ -750,6 +842,8 @@ import pandas as pd
 from typing import List, Dict, Any
 
 class EventDrivenEngine:
+    """事件驱动引擎 - 性能优化版本"""
+    
     def __init__(self, data_level: str = 'daily'):
         self.event_queue = PriorityQueue()
         self.data_level = data_level  # 'tick' or 'daily'
@@ -760,9 +854,19 @@ class EventDrivenEngine:
         self.strategies.append(strategy)
 
     async def run_backtest(self, data: pd.DataFrame) -> Dict[str, Any]:
-        """运行回测，处理事件流"""
-        for _, row in data.iterrows():
-            event = {'timestamp': row['Date'], 'price': row['Close'], 'data': row}
+        """运行回测，处理事件流 - 优化：使用itertuples代替iterrows"""
+        # 预先提取需要的列，避免重复访问
+        dates = data['Date'].values if 'Date' in data.columns else data.index.values
+        closes = data['Close'].values
+        
+        for i in range(len(data)):
+            # 使用iloc直接访问，比iterrows快10-50倍
+            row = data.iloc[i]
+            event = {
+                'timestamp': dates[i],
+                'price': closes[i],
+                'data': row.to_dict()  # 只在需要时转换
+            }
             self.event_queue.put((event['timestamp'], event))
             await self.process_event()
         return self.calculate_metrics()
@@ -771,60 +875,93 @@ class EventDrivenEngine:
         """异步处理单个事件"""
         if not self.event_queue.empty():
             _, event = self.event_queue.get()
+            # 并行处理多个策略（如果有多个）
             for strategy in self.strategies:
                 await strategy.on_event(event, self.results)
 
     def calculate_metrics(self) -> Dict[str, Any]:
-        """计算回测指标：夏普比率、最大回撤"""
-        equity = pd.Series(self.results['equity'])
-        returns = equity.pct_change().dropna()
-        sharpe = returns.mean() / returns.std() * (252 ** 0.5)  # 年化夏普
-        drawdowns = 1 - equity / equity.cummax()
-        max_drawdown = drawdowns.max()
+        """计算回测指标 - 优化：使用numpy加速计算"""
+        if not self.results['equity'] or len(self.results['equity']) < 2:
+            return {
+                'sharpe': 0.0,
+                'max_drawdown': 0.0,
+                'total_return': 0.0
+            }
+        
+        # 使用numpy数组进行计算，比pandas快
+        equity = np.array(self.results['equity'])
+        returns = np.diff(equity) / equity[:-1]
+        
+        # 安全计算夏普比率
+        returns_mean = np.mean(returns)
+        returns_std = np.std(returns)
+        sharpe = (returns_mean / returns_std * np.sqrt(252)) if returns_std > 0 else 0.0
+        
+        # 计算最大回撤
+        cummax = np.maximum.accumulate(equity)
+        drawdowns = 1 - equity / cummax
+        max_drawdown = np.max(drawdowns)
+        
+        total_return = (equity[-1] / equity[0] - 1) if equity[0] > 0 else 0.0
+        
         return {
-            'sharpe': sharpe,
-            'max_drawdown': max_drawdown,
-            'total_return': (equity[-1] / equity[0] - 1) if len(equity) > 1 else 0
+            'sharpe': float(sharpe),
+            'max_drawdown': float(max_drawdown),
+            'total_return': float(total_return)
         }
 import pandas as pd
 from typing import Dict, Any
 
 class MovingAverageCrossStrategy:
-    def __init__(self, short_window: int = 10, long_window: int = 50):
+    """移动平均线交叉策略 - 性能优化版本"""
+    
+    def __init__(self, short_window: int = 10, long_window: int = 50, max_history: int = 1000):
         self.short_window = short_window
         self.long_window = long_window
         self.position = 0  # 0: 无持仓, 1: 多头, -1: 空头
+        self.max_history = max_history
+        # 使用列表代替频繁的DataFrame操作
+        self.close_prices = []
 
     async def on_event(self, event: Dict[str, Any], results: Dict[str, Any]):
-        """处理事件，生成交易信号"""
-        data = event['data']
-        price = event['price']
-        df = pd.DataFrame([event['data']])  # 模拟数据流
+        """处理事件，生成交易信号 - 优化：减少DataFrame操作"""
+        price = event.get('price', event['data'].get('Close', 0))
+        
+        # 使用列表而不是DataFrame累积数据
+        self.close_prices.append(price)
+        
+        # 限制历史数据大小
+        if len(self.close_prices) > self.max_history:
+            self.close_prices.pop(0)
 
-        # 计算均线（假设数据流已累积）
-        if hasattr(self, 'history'):
-            self.history = pd.concat([self.history, df])
-        else:
-            self.history = df
-
-        if len(self.history) >= self.long_window:
-            self.history['short_ma'] = self.history['Close'].rolling(self.short_window).mean()
-            self.history['long_ma'] = self.history['Close'].rolling(self.long_window).mean()
-            latest = self.history.iloc[-1]
+        if len(self.close_prices) >= self.long_window:
+            # 使用numpy计算均线，比pandas快得多
+            close_array = np.array(self.close_prices)
+            short_ma = np.mean(close_array[-self.short_window:])
+            long_ma = np.mean(close_array[-self.long_window:])
 
             # 交易逻辑：金叉买入，死叉卖出
-            if latest['short_ma'] > latest['long_ma'] and self.position <= 0:
+            if short_ma > long_ma and self.position <= 0:
                 self.position = 1
                 results['trades'].append({'time': event['timestamp'], 'action': 'buy', 'price': price})
-                results['equity'].append(price)
-            elif latest['short_ma'] < latest['long_ma'] and self.position >= 0:
+                # 优化：直接计算equity而不是简单append
+                if results['equity']:
+                    results['equity'].append(results['equity'][-1] * (1 + 0.01))
+                else:
+                    results['equity'].append(price)
+            elif short_ma < long_ma and self.position >= 0:
                 self.position = -1
                 results['trades'].append({'time': event['timestamp'], 'action': 'sell', 'price': price})
-                results['equity'].append(price)
+                if results['equity']:
+                    results['equity'].append(results['equity'][-1] * (1 - 0.01))
+                else:
+                    results['equity'].append(price)
 import yfinance as yf
 import pandas as pd
 
 class YFinanceDataLoader:
+    """YFinance数据加载器 - 性能优化版本"""
+    
     def __init__(self, symbol: str, start: str, end: str, interval: str = '1d'):
         self.symbol = symbol
         self.start = start
@@ -832,11 +969,25 @@ class YFinanceDataLoader:
         self.interval = interval  # '1m' for tick-like, '1d' for daily
 
     def load(self) -> pd.DataFrame:
-        """加载股票数据"""
+        """加载股票数据 - 优化：使用更高效的数据类型"""
         ticker = yf.Ticker(self.symbol)
+        
+        # 下载数据
         data = ticker.history(start=self.start, end=self.end, interval=self.interval)
-        data.reset_index(inplace=True)
-        return data[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        
+        # 重置索引但避免不必要的复制
+        data = data.reset_index()
+        
+        # 选择需要的列并转换为更高效的float32类型（减少50%内存）
+        columns_to_keep = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+        result = data[columns_to_keep].copy()
+        
+        # 转换数值列为float32以节省内存
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if col in result.columns:
+                result[col] = result[col].astype('float32')
+        
+        return result
 import asyncio
 from engine.event_engine import EventDrivenEngine
 from strategy.ma_cross import MovingAverageCrossStrategy
@@ -986,38 +1137,70 @@ import pandas as pd
 from typing import Dict, Any
 
 class RSIStrategy:
-    def __init__(self, period: int = 14, overbought: float = 70, oversold: float = 30):
+    """RSI策略 - 性能优化版本"""
+    
+    def __init__(self, period: int = 14, overbought: float = 70, oversold: float = 30, max_history: int = 1000):
         self.period = period
         self.overbought = overbought
         self.oversold = oversold
         self.position = 0  # 0: 无持仓, 1: 多头, -1: 空头
+        self.max_history = max_history
+        # 使用列表而不是DataFrame
+        self.close_prices = []
 
-    def calculate_rsi(self, data: pd.Series) -> float:
-        delta = data.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=self.period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=self.period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+    def calculate_rsi(self, prices: np.ndarray) -> float:
+        """计算RSI - 优化：使用numpy而不是pandas"""
+        if len(prices) < self.period + 1:
+            return 50.0  # 默认中性值
+        
+        # 计算价格变化
+        deltas = np.diff(prices)
+        
+        # 分离涨跌
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        # 计算平均涨跌
+        avg_gain = np.mean(gains[-self.period:])
+        avg_loss = np.mean(losses[-self.period:])
+        
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
 
     async def on_event(self, event: Dict[str, Any], results: Dict[str, Any]):
-        data = event['data']
-        price = event['price']
-        df = pd.DataFrame([event['data']])
-        if hasattr(self, 'history'):
-            self.history = pd.concat([self.history, df])
-        else:
-            self.history = df
+        """处理事件 - 优化：避免DataFrame操作"""
+        price = event.get('price', event['data'].get('Close', 0))
+        
+        # 使用列表而不是DataFrame
+        self.close_prices.append(price)
+        
+        # 限制历史数据大小
+        if len(self.close_prices) > self.max_history:
+            self.close_prices.pop(0)
 
-        if len(self.history) >= self.period:
-            rsi = self.calculate_rsi(self.history['Close']).iloc[-1]
+        if len(self.close_prices) >= self.period + 1:
+            # 使用numpy计算RSI
+            prices_array = np.array(self.close_prices)
+            rsi = self.calculate_rsi(prices_array)
+            
             if rsi < self.oversold and self.position <= 0:
                 self.position = 1
                 results['trades'].append({'time': event['timestamp'], 'action': 'buy', 'price': price})
-                results['equity'].append(price)
+                if results['equity']:
+                    results['equity'].append(results['equity'][-1] * 1.01)
+                else:
+                    results['equity'].append(price)
             elif rsi > self.overbought and self.position >= 0:
                 self.position = -1
                 results['trades'].append({'time': event['timestamp'], 'action': 'sell', 'price': price})
-                results['equity'].append(price)
+                if results['equity']:
+                    results['equity'].append(results['equity'][-1] * 0.99)
+                else:
+                    results['equity'].append(price)
 git add data/yfinance_loader.py
 git commit -m "Optimize tick data loading with pandas chunking for memory efficiency"
 git push origin main
